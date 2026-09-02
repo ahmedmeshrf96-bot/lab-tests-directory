@@ -1,0 +1,473 @@
+name: Windows V145 Android V143 Full Parity
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tahalil-windows-v145-android-v143-full-parity
+  cancel-in-progress: false
+
+jobs:
+  windows-v145:
+    name: Build + Audit + Release Windows V145
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      ANDROID_V143_SHA: "337332bb4d083735d0c911747d7bdfccb5872701"
+      V144_SOURCE_SHA256: "fc6420cc8a4e791dd0a41a2a226d4738bf855f1421bcc50031572584d4d0e65c"
+
+    steps:
+      - name: Checkout delivery repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Reconstruct exact green Windows V144 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $url="https://github.com/$env:GITHUB_REPOSITORY/releases/download/v144-windows/Tahalil-Alakkad-V144-Windows-SOURCE.zip"
+          curl.exe --fail --location --retry 4 --retry-delay 2 $url -o v144-source.zip
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download Windows V144 source' }
+
+          $actual=(Get-FileHash v144-source.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($actual -ne $env:V144_SOURCE_SHA256){throw "V144 source SHA mismatch: $actual"}
+
+          Remove-Item extracted_v144 -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item build_v145_windows -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -Path v144-source.zip -DestinationPath extracted_v144 -Force
+
+          $pkg=Get-ChildItem extracted_v144 -Recurse -Filter package.json -File |
+            Where-Object { $_.FullName -notmatch '[\\/]node_modules[\\/]' } |
+            Select-Object -First 1
+          if(!$pkg){throw 'package.json not found in exact V144 source'}
+
+          $srcRoot=$pkg.Directory.FullName
+          $dest=Join-Path $PWD 'build_v145_windows/windows-system'
+          New-Item -ItemType Directory -Path $dest -Force | Out-Null
+          Get-ChildItem -LiteralPath $srcRoot -Force | Copy-Item -Destination $dest -Recurse -Force
+          if(!(Test-Path (Join-Path $dest 'package.json'))){throw 'V144 reconstruction failed'}
+          Write-Host 'Exact Windows V144 source reconstructed and hash verified.'
+
+      - name: Fetch immutable Android V143 final R2 search source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $base="https://raw.githubusercontent.com/ahmedmeshrf22-jpg/lab-tests-directory/$env:ANDROID_V143_SHA"
+          curl.exe --fail --location --retry 4 "$base/app/src/main/assets/lab_tests_android.json" -o android-v143-catalog.json
+          if($LASTEXITCODE -ne 0){throw 'Could not fetch Android V143 catalogue'}
+          curl.exe --fail --location --retry 4 "$base/app/src/main/java/com/example/data/repository/LabTestRepository.kt" -o android-v143-repository.kt
+          if($LASTEXITCODE -ne 0){throw 'Could not fetch Android V143 repository'}
+          curl.exe --fail --location --retry 4 "$base/app/src/main/java/com/example/ui/LabTestsViewModel.kt" -o android-v143-viewmodel.kt
+          if($LASTEXITCODE -ne 0){throw 'Could not fetch Android V143 ViewModel'}
+          curl.exe --fail --location --retry 4 "$base/app/build.gradle.kts" -o android-v143-build.gradle.kts
+          if($LASTEXITCODE -ne 0){throw 'Could not fetch Android V143 build metadata'}
+
+      - name: Verify Android V143 final baseline
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $grad=Get-Content android-v143-build.gradle.kts -Raw
+          if(!$grad.Contains('versionCode = 143')){throw 'Android source is not V143'}
+          if(!$grad.Contains('versionName = "5.63-organ-search-everywhere-v143"')){throw 'Android V143 versionName mismatch'}
+          $vm=Get-Content android-v143-viewmodel.kt -Raw
+          if(!$vm.Contains('(smartMatches + directMatches).distinctBy { it.id }')){throw 'Android V143 smart/direct merge marker missing'}
+          $repo=Get-Content android-v143-repository.kt -Raw
+          if(!$repo.Contains('V142 semantic organ/system search')){throw 'Android V142 semantic search baseline missing'}
+          if(!$repo.Contains('عايز اطمن على القلب')){throw 'Android heart natural-language alias missing'}
+          Write-Host 'Android V143 final R2 baseline verified.'
+
+      - name: Apply Windows V145 full parity patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          from pathlib import Path
+          import json, re
+
+          root=Path('build_v145_windows/windows-system')
+          pkg_path=root/'package.json'
+          pkg=json.loads(pkg_path.read_text(encoding='utf-8-sig'))
+          if str(pkg.get('version'))!='144.0.0':
+              raise SystemExit(f"Expected Windows V144 package, got {pkg.get('version')}")
+          pkg['version']='145.0.0'
+          build=pkg.setdefault('build',{})
+          for key in ('portable','nsis'):
+              target=build.get(key)
+              if isinstance(target,dict) and isinstance(target.get('artifactName'),str):
+                  target['artifactName']=target['artifactName'].replace('V144','V145')
+          pkg_path.write_text(json.dumps(pkg,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+
+          lock_path=root/'package-lock.json'
+          if lock_path.exists():
+              lock=json.loads(lock_path.read_text(encoding='utf-8-sig'))
+              if lock.get('version')=='144.0.0': lock['version']='145.0.0'
+              packs=lock.get('packages')
+              if isinstance(packs,dict) and isinstance(packs.get(''),dict) and packs[''].get('version')=='144.0.0':
+                  packs['']['version']='145.0.0'
+              lock_path.write_text(json.dumps(lock,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+
+          def replace_if_present(rel, pairs, required=True):
+              p=root/rel
+              if not p.exists():
+                  if required: raise SystemExit(f'Missing required Windows file: {rel}')
+                  return
+              text=p.read_text(encoding='utf-8')
+              for old,new in pairs:
+                  if old not in text:
+                      if required: raise SystemExit(f'Missing marker in {rel}: {old}')
+                  else:
+                      text=text.replace(old,new)
+              p.write_text(text,encoding='utf-8')
+
+          replace_if_present('src/backup.js',[
+              ('app_version_code:144','app_version_code:145'),
+              ("app_version_name:'System V144 Windows'","app_version_name:'System V145 Windows'"),
+          ])
+          replace_if_present('src/shadowBackup.js',[
+              ('appVersionCode: 144','appVersionCode: 145'),
+              ("appVersionName: 'Windows V144'","appVersionName: 'Windows V145'"),
+          ])
+          replace_if_present('src/app.js',[
+              ('Unified System V144','Unified System V145'),
+              ('Windows V144','Windows V145'),
+              ('Supabase Shadow Backup V144:','Supabase Shadow Backup V145:'),
+              ('Backup مشفر V144','Backup مشفر V145'),
+              ('Safe Restore V144','Safe Restore V145'),
+          ])
+          replace_if_present('electron/main.cjs',[
+              ("appVersionCode: 144, appVersionName: 'Windows V144'","appVersionCode: 145, appVersionName: 'Windows V145'"),
+              ("tray.setToolTip('تحاليل العقاد — Windows V144')","tray.setToolTip('تحاليل العقاد — Windows V145')"),
+          ])
+
+          tests=json.loads(Path('android-v143-catalog.json').read_text(encoding='utf-8-sig'))
+          if len(tests)!=331: raise SystemExit(f'Expected 331 Android V143 tests, got {len(tests)}')
+          if any(t.get('customer_price') not in (None,'') for t in tests):
+              raise SystemExit('Android catalogue unexpectedly embeds customer prices')
+
+          # Project every Android V142/V143 alias rule into search_text so the existing
+          # Windows search pipeline sees the same clinical language, abbreviations and organs.
+          kt=Path('android-v143-repository.kt').read_text(encoding='utf-8')
+          rule_re=re.compile(r'AliasRule\(\s*listOf\((.*?)\)\s*,\s*listOf\((.*?)\)\s*\)',re.S)
+          quoted_re=re.compile(r'"((?:\\.|[^"\\])*)"')
+          def strings(fragment):
+              out=[]
+              for raw in quoted_re.findall(fragment):
+                  try: out.append(json.loads('"'+raw+'"'))
+                  except Exception: out.append(raw.replace('\\"','"').replace('\\\\','\\'))
+              return out
+
+          rules=[]
+          for m in rule_re.finditer(kt):
+              keys,targets=strings(m.group(1)),strings(m.group(2))
+              if keys and targets: rules.append((keys,targets))
+          if len(rules)<35: raise SystemExit(f'Too few Android alias rules parsed: {len(rules)}')
+
+          by_name={str(t.get('english_name','')).strip().casefold():t for t in tests}
+          touched=set(); unresolved=set()
+          for keys,targets in rules:
+              for target in targets:
+                  t=by_name.get(target.strip().casefold())
+                  if not t:
+                      unresolved.add(target); continue
+                  cur=str(t.get('search_text','')).strip()
+                  parts=[x.strip() for x in cur.split('|') if x.strip()]
+                  seen={x.casefold() for x in parts}
+                  for key in keys:
+                      k=key.strip()
+                      if k and k.casefold() not in seen:
+                          parts.append(k); seen.add(k.casefold())
+                  t['search_text']=' | '.join(parts)
+                  touched.add(t.get('id'))
+
+          heart=['CK-MB','Troponin I (Qualitative)','Troponin I (Quantitative)','Homocysteine','CRP','LDH (Lactate Dehydrogenase)','Cholesterol','HDL','LDL Cholesterol','Triglyceride']
+          for name in heart:
+              t=by_name.get(name.casefold())
+              if not t: raise SystemExit(f'Heart target missing: {name}')
+              st=str(t.get('search_text',''))
+              for marker in ('القلب','heart','عايز اطمن على القلب'):
+                  if marker not in st: raise SystemExit(f'Heart alias {marker!r} missing: {name}')
+
+          shorthand={'CBC':'cbc','Free T4':'ft4','D-Dimer':'ddimer','GGT':'ggt','PSA (Free)':'fpsa'}
+          for target,alias in shorthand.items():
+              t=by_name.get(target.casefold())
+              if not t or alias not in str(t.get('search_text','')).casefold():
+                  raise SystemExit(f'V142 shorthand parity missing: {alias} -> {target}')
+
+          catalog=root/'public/lab_tests_android.json'
+          catalog.write_text(json.dumps(tests,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+
+          source_files=list((root/'src').rglob('*.js'))+list((root/'electron').rglob('*.cjs'))
+          combined='\n'.join(p.read_text(encoding='utf-8',errors='ignore') for p in source_files)
+          low=combined.lower()
+          if 'search_text' not in combined and 'searchtext' not in low:
+              raise SystemExit('Windows search pipeline does not consume search_text/searchText')
+
+          notes=(
+              'Windows V145 — Android V143 Full Parity\n'
+              'Base: exact green Windows V144 source release (SHA256 verified).\n'
+              'Android baseline: V143 final R2 commit 337332bb4d083735d0c911747d7bdfccb5872701.\n'
+              '331-test catalogue aligned with Android V143.\n'
+              f'Android alias rules projected into Windows search_text: {len(rules)} rules; {len(touched)} catalogue rows touched.\n'
+              'V142 abbreviations/clinical wording preserved.\n'
+              'V143 organ/system search preserved; heart acceptance 10/10.\n'
+              'Shared catalogue/prices/results, backup, offline, failover, reconciliation, screenshots, tray and updater stay on the V144 Windows architecture.\n'
+              f'Optional unresolved catalogue names: {len(unresolved)}.\n'
+          )
+          (root/'V145_ANDROID_V143_FULL_PARITY_NOTES.txt').write_text(notes,encoding='utf-8')
+          print(notes)
+          '@ | Set-Content apply_v145.py -Encoding utf8
+          python apply_v145.py
+          if($LASTEXITCODE -ne 0){throw 'V145 parity patch failed'}
+
+      - name: Deep audit cross-platform linkage and preservation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path $PWD 'build_v145_windows/windows-system'
+
+          $pkg=Get-Content (Join-Path $root 'package.json') -Raw | ConvertFrom-Json
+          if($pkg.version -ne '145.0.0'){throw 'Expected Windows V145 package'}
+          if($pkg.build.portable.artifactName -notmatch 'V145'){throw 'Portable V145 artifact name missing'}
+          if($pkg.build.nsis.artifactName -notmatch 'V145'){throw 'Setup V145 artifact name missing'}
+
+          $tests=Get-Content (Join-Path $root 'public/lab_tests_android.json') -Raw | ConvertFrom-Json
+          if($tests.Count -ne 331){throw "Expected 331 tests, got $($tests.Count)"}
+          if(($tests | Where-Object { $null -ne $_.customer_price -and [string]$_.customer_price -ne '' }).Count -ne 0){throw 'Embedded customer prices detected'}
+
+          $heart=@('CK-MB','Troponin I (Qualitative)','Troponin I (Quantitative)','Homocysteine','CRP','LDH (Lactate Dehydrogenase)','Cholesterol','HDL','LDL Cholesterol','Triglyceride')
+          foreach($name in $heart){
+            $t=$tests | Where-Object { $_.english_name -eq $name } | Select-Object -First 1
+            if(!$t){throw "Heart test missing: $name"}
+            foreach($marker in @('القلب','heart','عايز اطمن على القلب')){
+              if(!([string]$t.search_text).Contains($marker)){throw "Heart alias $marker missing: $name"}
+            }
+          }
+
+          $data=Get-Content (Join-Path $root 'src/data.js') -Raw
+          foreach($x in @('lab_catalog_overrides','watchCatalog','saveCatalogOverride','saveCustomerPricesBulk','test_','requestResultRevision','resetUserLoginCredentials')){
+            if(!$data.Contains($x)){throw "Shared Android/Windows data marker missing: $x"}
+          }
+
+          $backup=Get-Content (Join-Path $root 'src/backup.js') -Raw
+          foreach($x in @('const SCHEMA=3','app_version_code:145',"app_version_name:'System V145 Windows'",'lab_catalog_overrides','getDocFromServer','if(!snap.exists())missing.push(write)')){
+            if(!$backup.Contains($x)){throw "Backup/linkage marker missing: $x"}
+          }
+
+          $shadow=Get-Content (Join-Path $root 'src/shadowBackup.js') -Raw
+          foreach($x in @('tahalil-shadow-mirror','appVersionCode: 145',"appVersionName: 'Windows V145'",'Shadow backup is deliberately non-blocking')){
+            if(!$shadow.Contains($x)){throw "Shadow marker missing: $x"}
+          }
+
+          $appjs=Get-Content (Join-Path $root 'src/app.js') -Raw
+          foreach($x in @('Unified System V145','Windows V145','watchCatalog','watchOverrides','saveCustomerPricesBulk','تم الاسترجاع ✓')){
+            if(!$appjs.Contains($x)){throw "UI/shared-data marker missing: $x"}
+          }
+
+          $main=Get-Content (Join-Path $root 'electron/main.cjs') -Raw
+          foreach($x in @(
+            'https://github.com/ahmedmeshrf96-bot/lab-tests-directory/releases/latest/download/latest-windows.json',
+            "appVersionCode: 145, appVersionName: 'Windows V145'",
+            "tray.setToolTip('تحاليل العقاد — Windows V145')",
+            'MAX_WINDOWS_UPDATE_BYTES','downloadWindowsUpdate','sha256FileAsync','scheduleWindowsUpdateCheck',
+            "FAILOVER_ENDPOINT = 'https://ogidyelgmigcvasizzuv.supabase.co/functions/v1/tahalil-failover-read'",
+            "RESULT_FAILOVER_ENDPOINT = 'https://ogidyelgmigcvasizzuv.supabase.co/functions/v1/tahalil-result-failover'",
+            "RECONCILE_ENDPOINT = 'https://ogidyelgmigcvasizzuv.supabase.co/functions/v1/tahalil-shadow-reconcile'",
+            'OFFLINE_GRACE_MS = 72 * 60 * 60 * 1000','target.setHours(4,0,0,0)','safeStorage.encryptString',
+            'setLoginItemSettings','new Tray','requestSingleInstanceLock','sandbox: true','contextIsolation: true',
+            'nodeIntegration: false','webSecurity: true','setContentProtection(false)'
+          )){if(!$main.Contains($x)){throw "Windows V144 preservation marker missing after V145 patch: $x"}}
+          if($main.Contains('setContentProtection(true)')){throw 'Screenshot blocking reappeared'}
+
+          $all=@('src/app.js','src/data.js','src/backup.js','src/shadowBackup.js','src/failover.js','src/resultFailover.js','src/shadowReconcile.js','electron/main.cjs','electron/preload.cjs')
+          $combined=($all | ForEach-Object {Get-Content (Join-Path $root $_) -Raw}) -join "`n"
+          $low=$combined.ToLowerInvariant()
+          if($low.Contains('cloudflare') -or $low.Contains('workers.dev')){throw 'Cloudflare dependency detected'}
+          if($low.Contains('sendpasswordresetemail')){throw 'Email password reset reappeared'}
+          foreach($secret in @('SUPABASE_SERVICE_ROLE_KEY','SUPABASE_SECRET_KEYS','sb_secret_','BEGIN PRIVATE KEY')){
+            if($combined.Contains($secret)){throw "Forbidden secret marker: $secret"}
+          }
+          Write-Host 'WINDOWS V145 <-> ANDROID V143 LINKAGE AUDIT PASSED'
+
+      - name: JavaScript syntax checks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path $PWD 'build_v145_windows/windows-system'
+          Get-ChildItem (Join-Path $root 'src') -Filter '*.js' -File | ForEach-Object {
+            Get-Content $_.FullName -Raw | node --input-type=module --check
+            if($LASTEXITCODE -ne 0){throw "JS syntax failed: $($_.Name)"}
+          }
+          node --check (Join-Path $root 'electron/main.cjs')
+          if($LASTEXITCODE -ne 0){throw 'main.cjs syntax failed'}
+          node --check (Join-Path $root 'electron/preload.cjs')
+          if($LASTEXITCODE -ne 0){throw 'preload.cjs syntax failed'}
+
+      - name: Snapshot V145 source before dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          if(Test-Path v145-source.zip){Remove-Item v145-source.zip -Force}
+          Compress-Archive -Path 'build_v145_windows/windows-system' -DestinationPath v145-source.zip -CompressionLevel Optimal
+          if(!(Test-Path v145-source.zip)){throw 'V145 source archive missing'}
+
+      - name: Install dependencies
+        working-directory: build_v145_windows/windows-system
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          npm install --no-audit --no-fund
+          if($LASTEXITCODE -ne 0){throw 'npm install failed'}
+
+      - name: Build Portable
+        working-directory: build_v145_windows/windows-system
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          npm run dist:portable
+          if($LASTEXITCODE -ne 0){throw 'Portable build failed'}
+
+      - name: Portable startup smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $release=Join-Path $PWD 'build_v145_windows/windows-system/release'
+          $exe=Get-ChildItem $release -Filter '*Portable*.exe' -File | Sort-Object Length -Descending | Select-Object -First 1
+          if(!$exe){throw 'Portable EXE missing'}
+          $env:TAHALIL_SMOKE_TEST='1'
+          $p=Start-Process $exe.FullName -PassThru
+          if(!$p.WaitForExit(45000)){Stop-Process -Id $p.Id -Force;throw 'Portable smoke timed out'}
+          if($p.ExitCode -ne 0){throw "Portable smoke exit code $($p.ExitCode)"}
+          Remove-Item Env:TAHALIL_SMOKE_TEST -ErrorAction SilentlyContinue
+
+      - name: System Tray smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $release=Join-Path $PWD 'build_v145_windows/windows-system/release'
+          $exe=Get-ChildItem $release -Filter '*Portable*.exe' -File | Sort-Object Length -Descending | Select-Object -First 1
+          $env:TAHALIL_TRAY_SMOKE_TEST='1'
+          $p=Start-Process $exe.FullName -PassThru
+          if(!$p.WaitForExit(45000)){Stop-Process -Id $p.Id -Force;throw 'Tray smoke timed out'}
+          if($p.ExitCode -ne 0){throw "Tray smoke exit code $($p.ExitCode)"}
+          Remove-Item Env:TAHALIL_TRAY_SMOKE_TEST -ErrorAction SilentlyContinue
+
+      - name: Background startup smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $release=Join-Path $PWD 'build_v145_windows/windows-system/release'
+          $exe=Get-ChildItem $release -Filter '*Portable*.exe' -File | Sort-Object Length -Descending | Select-Object -First 1
+          $p=Start-Process $exe.FullName -ArgumentList '--background' -PassThru
+          Start-Sleep -Seconds 5
+          if($p.HasExited){throw "Background startup exited with $($p.ExitCode)"}
+          Stop-Process -Id $p.Id -Force
+
+      - name: Build Setup
+        working-directory: build_v145_windows/windows-system
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          npm run dist:setup
+          if($LASTEXITCODE -ne 0){throw 'Setup build failed'}
+
+      - name: Prepare V145 delivery and update manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $release=Join-Path $PWD 'build_v145_windows/windows-system/release'
+          $portable=Get-ChildItem $release -Filter '*Portable*.exe' -File | Sort-Object Length -Descending | Select-Object -First 1
+          $setup=Get-ChildItem $release -Filter '*Setup*.exe' -File | Sort-Object Length -Descending | Select-Object -First 1
+          if(!$portable -or !$setup){throw 'Setup/Portable missing'}
+          Copy-Item $portable.FullName 'Tahalil-Alakkad-V145-Windows-Portable.exe' -Force
+          Copy-Item $setup.FullName 'Tahalil-Alakkad-V145-Windows-Setup.exe' -Force
+          Copy-Item $setup.FullName 'Tahalil-Alakkad-Windows-LATEST-Setup.exe' -Force
+          Copy-Item v145-source.zip 'Tahalil-Alakkad-V145-Windows-SOURCE.zip' -Force
+          foreach($name in @('Tahalil-Alakkad-V145-Windows-Portable.exe','Tahalil-Alakkad-V145-Windows-Setup.exe','Tahalil-Alakkad-Windows-LATEST-Setup.exe','Tahalil-Alakkad-V145-Windows-SOURCE.zip')){
+            $hash=(Get-FileHash $name -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $name" | Set-Content "$name.sha256" -Encoding ascii
+          }
+          $setupSha=(Get-FileHash 'Tahalil-Alakkad-V145-Windows-Setup.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifest=[ordered]@{
+            versionCode=145
+            versionName='Windows V145 Android V143 Full Parity'
+            setupUrl='https://github.com/ahmedmeshrf96-bot/lab-tests-directory/releases/download/v145-windows/Tahalil-Alakkad-V145-Windows-Setup.exe'
+            sha256=$setupSha
+            mandatory=$true
+          }
+          $manifest | ConvertTo-Json | Set-Content latest-windows.json -Encoding utf8
+
+      - name: Upload V145 delivery artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tahalil-Alakkad-Windows-V145-ANDROID-V143-FULL-PARITY
+          path: |
+            Tahalil-Alakkad-V145-Windows-Portable.exe
+            Tahalil-Alakkad-V145-Windows-Portable.exe.sha256
+            Tahalil-Alakkad-V145-Windows-Setup.exe
+            Tahalil-Alakkad-V145-Windows-Setup.exe.sha256
+            Tahalil-Alakkad-Windows-LATEST-Setup.exe
+            Tahalil-Alakkad-Windows-LATEST-Setup.exe.sha256
+            Tahalil-Alakkad-V145-Windows-SOURCE.zip
+            Tahalil-Alakkad-V145-Windows-SOURCE.zip.sha256
+            latest-windows.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish Windows V145 release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $tag='v145-windows'
+          gh release view $tag --repo "$env:GITHUB_REPOSITORY" *> $null
+          if($LASTEXITCODE -eq 0){throw 'Release v145-windows already exists; refusing overwrite'}
+          gh release create $tag `
+            'Tahalil-Alakkad-V145-Windows-Portable.exe' `
+            'Tahalil-Alakkad-V145-Windows-Portable.exe.sha256' `
+            'Tahalil-Alakkad-V145-Windows-Setup.exe' `
+            'Tahalil-Alakkad-V145-Windows-Setup.exe.sha256' `
+            'Tahalil-Alakkad-Windows-LATEST-Setup.exe' `
+            'Tahalil-Alakkad-Windows-LATEST-Setup.exe.sha256' `
+            'Tahalil-Alakkad-V145-Windows-SOURCE.zip' `
+            'Tahalil-Alakkad-V145-Windows-SOURCE.zip.sha256' `
+            'latest-windows.json' `
+            --repo "$env:GITHUB_REPOSITORY" `
+            --title "تحاليل العقاد Windows V145 — Android V143 Full Parity" `
+            --notes "Exact Windows V144 green source + Android V143 final R2 search parity. V142 abbreviations/clinical wording and V143 organ search are projected into the Windows catalogue search_text. Shared Firebase catalogue/prices/results, Supabase failover/reconciliation, encrypted 04:00 backup, offline mode, screenshots, tray, updater and Electron hardening are preserved. Android is untouched." `
+            --latest
+          if($LASTEXITCODE -ne 0){throw 'V145 release create failed'}
+
+      - name: Verify V145 public update channel
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          Start-Sleep -Seconds 3
+          $url="https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/latest-windows.json"
+          curl.exe --fail --location --retry 3 $url -o public-latest-windows.json
+          if($LASTEXITCODE -ne 0){throw 'Could not download public latest-windows.json'}
+          $m=Get-Content public-latest-windows.json -Raw | ConvertFrom-Json
+          if($m.versionCode -ne 145){throw "Public channel version is $($m.versionCode), expected 145"}
+          if($m.versionName -ne 'Windows V145 Android V143 Full Parity'){throw 'Public versionName mismatch'}
+          if($m.mandatory -ne $true){throw 'Public update must be mandatory'}
+          $localSha=(Get-FileHash 'Tahalil-Alakkad-V145-Windows-Setup.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($m.sha256 -ne $localSha){throw 'Public SHA256 mismatch'}
+          $assets=gh release view v145-windows --repo "$env:GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
+          foreach($needed in @('Tahalil-Alakkad-V145-Windows-Setup.exe','Tahalil-Alakkad-V145-Windows-Portable.exe','Tahalil-Alakkad-V145-Windows-SOURCE.zip','latest-windows.json')){
+            if($assets -notcontains $needed){throw "Missing release asset: $needed"}
+          }
+          Write-Host 'WINDOWS V145 PUBLIC CHANNEL VERIFIED'
+
+      - name: Final status
+        shell: pwsh
+        run: Write-Host 'WINDOWS V145 ANDROID V143 FULL PARITY BUILT, LINK-AUDITED, SMOKE-TESTED, RELEASED AND VERIFIED'
